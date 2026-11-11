@@ -1,0 +1,41 @@
+name: release
+
+# Publishes the linux/amd64 image of a release tag to the GitHub container
+# registry. Run it by hand, with the tag, to publish a tag pushed before this
+# workflow existed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.2.0)
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/sigeth/opslab-gateway
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dagger/dagger-for-github@v8.4.1
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          version: "0.21.11"
+          module: github.com/Sigeth/opslab-ci@v0.2.0
+          verb: call
+          args: >-
+            image --source=.
+            with-registry-auth --address=ghcr.io --username=${{ github.actor }} --secret=env://REGISTRY_TOKEN
+            publish --address=${{ env.IMAGE }}:${{ env.TAG }}
