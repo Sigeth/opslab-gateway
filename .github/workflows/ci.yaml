@@ -24,6 +24,19 @@ jobs:
           verb: call
           args: rust --source=. check --targets=lint,test,deny,build
 
+  # Builds and tests against the newest contract tag, to catch breakage
+  # before the pinned version is bumped.
+  contract-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.11"
+          module: github.com/Sigeth/opslab-ci@v0.1.0
+          verb: call
+          args: rust --source=. check --targets=contract-latest
+
   image:
     runs-on: ubuntu-latest
     steps:
