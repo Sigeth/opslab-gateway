@@ -1,0 +1,39 @@
+# cargo deny check — dependency policy (D14: MIT-compatible licenses only).
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[advisories]
+yanked = "deny"
+# jsonwebtoken's rust_crypto backend compiles every algorithm family. opslab
+# only signs and verifies EdDSA (Ed25519); Verifier rejects any other "alg",
+# so the RSA and ECDSA code below is never reached. Revisit when upgrading.
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin attack): RSA keys are never used" },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via p256/p384: ECDSA keys are never used" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# The shared crates are consumed from their git tags until published to crates.io.
+allow-git = ["https://github.com/Sigeth/opslab-core-rs"]
