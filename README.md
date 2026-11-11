@@ -34,3 +34,7 @@ make image   # linux/amd64 (podman or docker)
 ## Permissions
 
 The gateway reads `ChallengeInstance`s in the instances namespace. The operator binds it the `opslab-gateway-exec` ClusterRole (`pods/exec`) in each instance namespace, so it can exec into machines and nowhere else.
+
+## License
+
+[MIT](LICENSE)
