@@ -1,5 +1,8 @@
 //! HTTP routes.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::{FromRequestParts, Query, State};
 use axum::http::request::Parts;
@@ -11,11 +14,15 @@ use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 
 use crate::keys::KeyStore;
+use crate::terminal::{self, Machines};
 
 /// Shared state of the handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub keys: KeyStore,
+    pub machines: Arc<dyn Machines>,
+    /// Terminals without input for this long are closed.
+    pub idle_timeout: Duration,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -23,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/terminal", get(terminal::terminal))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -94,7 +102,7 @@ impl FromRequestParts<AppState> for Access {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     use axum::body::Body;
     use axum::http::Request;
@@ -104,11 +112,52 @@ mod tests {
 
     use super::*;
 
+    struct NoMachines;
+
+    #[async_trait::async_trait]
+    impl Machines for NoMachines {
+        async fn instance(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> kube::Result<Option<opslab_types::ChallengeInstance>> {
+            Ok(None)
+        }
+        async fn shell(&self, _: &terminal::Target) -> kube::Result<kube::api::AttachedProcess> {
+            unreachable!("no machine")
+        }
+    }
+
+    fn state(keys: KeyStore) -> AppState {
+        AppState {
+            keys,
+            machines: Arc::new(NoMachines),
+            idle_timeout: Duration::from_secs(60),
+        }
+    }
+
     fn setup() -> (Signer, Router) {
         let signer = Signer::generate().unwrap();
         let keys = KeyStore::default();
         keys.set(&signer.jwks()).unwrap();
-        (signer, router(AppState { keys }))
+        (signer, router(state(keys)))
+    }
+
+    #[tokio::test]
+    async fn terminals_of_missing_instances_are_denied() {
+        let (signer, app) = setup();
+        let req = Request::get(format!("/v1/terminal?token={}", token(&signer)))
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(header::SEC_WEBSOCKET_VERSION, "13")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(app, req).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::FORBIDDEN, "the instance does not exist")
+        );
     }
 
     fn token(signer: &Signer) -> String {
@@ -167,9 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_ready_until_keys_are_loaded() {
-        let app = router(AppState {
-            keys: KeyStore::default(),
-        });
+        let app = router(state(KeyStore::default()));
         let req = || Request::get("/readyz").body(Body::empty()).unwrap();
         assert_eq!(
             send(app.clone(), req()).await.0,

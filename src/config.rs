@@ -16,6 +16,9 @@ pub struct Config {
     pub jwks_refresh: Duration,
     /// Log as JSON lines (`OPSLAB_LOG_FORMAT=json`).
     pub log_json: bool,
+    /// Terminals without input for this long are closed
+    /// (`OPSLAB_TERMINAL_IDLE_SECS`, default 1800).
+    pub terminal_idle: Duration,
 }
 
 impl Config {
@@ -26,6 +29,7 @@ impl Config {
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let listen = get("OPSLAB_LISTEN").unwrap_or_else(|| "0.0.0.0:8081".into());
         let refresh = get("OPSLAB_JWKS_REFRESH_SECS").unwrap_or_else(|| "300".into());
+        let idle = get("OPSLAB_TERMINAL_IDLE_SECS").unwrap_or_else(|| "1800".into());
         Ok(Self {
             listen: listen
                 .parse()
@@ -36,6 +40,11 @@ impl Config {
                 format!("OPSLAB_JWKS_REFRESH_SECS: invalid number {refresh:?}")
             })?),
             log_json: get("OPSLAB_LOG_FORMAT").as_deref() == Some("json"),
+            terminal_idle: Duration::from_secs(
+                idle.parse().with_context(|| {
+                    format!("OPSLAB_TERMINAL_IDLE_SECS: invalid number {idle:?}")
+                })?,
+            ),
         })
     }
 }

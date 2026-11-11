@@ -4,6 +4,9 @@
 mod app;
 mod config;
 mod keys;
+mod terminal;
+
+use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -26,7 +29,14 @@ async fn main() -> anyhow::Result<()> {
         config.jwks_refresh,
     ));
 
-    let app = app::router(AppState { keys });
+    let client = kube::Client::try_default()
+        .await
+        .context("connecting to Kubernetes")?;
+    let app = app::router(AppState {
+        keys,
+        machines: Arc::new(terminal::Kube(client)),
+        idle_timeout: config.terminal_idle,
+    });
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
