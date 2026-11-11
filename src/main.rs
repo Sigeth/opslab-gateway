@@ -21,10 +21,11 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     init_tracing(config.log_json);
 
-    let keys = KeyStore::default();
+    let http = reqwest::Client::new();
+    let keys = KeyStore::with_source(http.clone(), config.jwks_url.clone());
     tokio::spawn(keys::refresh_forever(
         keys.clone(),
-        reqwest::Client::new(),
+        http,
         config.jwks_url.clone(),
         config.jwks_refresh,
     ));

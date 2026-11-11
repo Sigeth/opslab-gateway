@@ -90,7 +90,15 @@ impl FromRequestParts<AppState> for Access {
             )
                 .into_response());
         };
-        match verifier.verify(&token) {
+        let mut result = verifier.verify(&token);
+        // A key the gateway does not know yet: the api may have rotated it.
+        if matches!(result, Err(opslab_auth::Error::UnknownKeyId(_)))
+            && state.keys.refresh_now().await
+            && let Some(verifier) = state.keys.verifier()
+        {
+            result = verifier.verify(&token);
+        }
+        match result {
             Ok(claims) => Ok(Access(claims)),
             Err(e) => {
                 tracing::info!(error = %e, "rejected access token");
@@ -212,6 +220,26 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(send(app, foreign).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn accepts_tokens_of_a_rotated_key_right_away() {
+        // The api now signs with a new key; the gateway still has the old one.
+        let rotated = Signer::generate().unwrap();
+        let jwks = rotated.jwks();
+        let api = Router::new().route("/jwks.json", get(move || async move { axum::Json(jwks) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, api).await.unwrap() });
+
+        let keys =
+            KeyStore::with_source(reqwest::Client::new(), format!("http://{addr}/jwks.json"));
+        keys.set(&Signer::generate().unwrap().jwks()).unwrap();
+        let req = Request::get(format!("/v1/whoami?token={}", token(&rotated)))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(router(state(keys)), req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     #[tokio::test]
