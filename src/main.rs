@@ -4,6 +4,7 @@
 mod app;
 mod config;
 mod keys;
+mod ssh;
 mod terminal;
 
 use std::sync::Arc;

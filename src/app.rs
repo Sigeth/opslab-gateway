@@ -131,7 +131,7 @@ mod tests {
         ) -> kube::Result<Option<opslab_types::ChallengeInstance>> {
             Ok(None)
         }
-        async fn shell(&self, _: &terminal::Target) -> kube::Result<kube::api::AttachedProcess> {
+        async fn shell(&self, _: &terminal::Target) -> anyhow::Result<terminal::Shell> {
             unreachable!("no machine")
         }
     }

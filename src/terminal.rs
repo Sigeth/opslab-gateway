@@ -1,4 +1,5 @@
-//! Browser terminals: WebSocket ↔ Kubernetes exec into a machine's container.
+//! Browser terminals: WebSocket ↔ a shell on a machine, through Kubernetes
+//! exec (pod and sysbox machines) or SSH (vm machines, see [`crate::ssh`]).
 //!
 //! Protocol on the WebSocket:
 //! - client → gateway: binary frames are keystrokes (stdin); text frames are
@@ -9,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use axum::extract::State;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -16,17 +18,21 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::api::{AttachParams, AttachedProcess, TerminalSize};
 use kube::{Api, Client};
 use opslab_auth::{AccessClaims, AccessKind};
 use opslab_types::ChallengeInstance;
-use opslab_types::conventions::MACHINE_CONTAINER;
+use opslab_types::conventions::{
+    MACHINE_CONTAINER, SSH_PORT, SSH_SECRET, SSH_SECRET_KNOWN_HOSTS, SSH_SECRET_STUDENT_KEY,
+    STUDENT_USER,
+};
 use opslab_types::generated::challengeinstances::{
     ChallengeInstanceStatusMachinesRuntime, ChallengeInstanceStatusPhase,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::app::{Access, AppState};
 
@@ -37,9 +43,15 @@ const SHELL: &str = "export TERM=xterm-256color; cd \"$HOME\" 2>/dev/null; \
 
 /// Where a terminal opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Target {
-    pub namespace: String,
-    pub pod: String,
+pub enum Target {
+    /// Kubernetes exec into the machine container of a pod.
+    Exec { namespace: String, pod: String },
+    /// SSH login on a vm machine, with the keys of the instance namespace.
+    Ssh {
+        namespace: String,
+        host: String,
+        user: String,
+    },
 }
 
 /// Why a terminal cannot open.
@@ -55,17 +67,19 @@ pub enum Denied {
     NotReady,
     #[error("the machine has no terminal")]
     NoMachine,
+    #[error("terminals on virtual machines open as the student only")]
+    NotStudent,
 }
 
-/// Finds the pod a token grants a terminal on, checking the instance still
-/// exists, is ready and belongs to the token's user.
+/// Finds the machine a token grants a terminal on, checking the instance
+/// still exists, is ready and belongs to the token's user.
 pub fn resolve(
     claims: &AccessClaims,
     instance: Option<&ChallengeInstance>,
 ) -> Result<Target, Denied> {
-    if !matches!(claims.grant.kind, AccessKind::Terminal { .. }) {
+    let AccessKind::Terminal { user } = &claims.grant.kind else {
         return Err(Denied::NotATerminal);
-    }
+    };
     let instance = instance.ok_or(Denied::NoInstance)?;
     if instance.spec.owner.user_id != claims.grant.user_id {
         return Err(Denied::NotOwner);
@@ -82,16 +96,47 @@ pub fn resolve(
         .flatten()
         .find(|m| m.name == claims.grant.machine)
         .ok_or(Denied::NoMachine)?;
-    // Pod and sysbox machines are reached through exec; VMs through SSH (M2).
-    let exec = matches!(
-        machine.runtime,
-        ChallengeInstanceStatusMachinesRuntime::Pod
-            | ChallengeInstanceStatusMachinesRuntime::Sysbox
-    );
-    match (exec, machine.pod.clone(), status.namespace.clone()) {
-        (true, Some(pod), Some(namespace)) if machine.ready => Ok(Target { namespace, pod }),
-        _ => Err(Denied::NoMachine),
+    let namespace = status.namespace.clone().ok_or(Denied::NoMachine)?;
+    if !machine.ready {
+        return Err(Denied::NoMachine);
     }
+    match machine.runtime {
+        // Through exec, as the container user.
+        ChallengeInstanceStatusMachinesRuntime::Pod
+        | ChallengeInstanceStatusMachinesRuntime::Sysbox => {
+            let pod = machine.pod.clone().ok_or(Denied::NoMachine)?;
+            Ok(Target::Exec { namespace, pod })
+        }
+        // Over SSH: the gateway only holds the student's key.
+        ChallengeInstanceStatusMachinesRuntime::Vm => {
+            if user != STUDENT_USER {
+                return Err(Denied::NotStudent);
+            }
+            let host = machine.address.clone().ok_or(Denied::NoMachine)?;
+            Ok(Target::Ssh {
+                namespace,
+                host,
+                user: user.clone(),
+            })
+        }
+        ChallengeInstanceStatusMachinesRuntime::Vcluster => Err(Denied::NoMachine),
+    }
+}
+
+/// An interactive shell: its output, and how to feed it.
+pub struct Shell {
+    /// Terminal output; closed when the shell exits.
+    pub output: mpsc::Receiver<Vec<u8>>,
+    pub io: Box<dyn ShellIo>,
+}
+
+/// Input side of a [`Shell`].
+#[async_trait]
+pub trait ShellIo: Send {
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<()>;
+    async fn resize(&mut self, cols: u16, rows: u16);
+    /// Ends the shell.
+    async fn close(&mut self);
 }
 
 /// Opens shells in machines. Faked in tests.
@@ -102,7 +147,7 @@ pub trait Machines: Send + Sync {
         namespace: &str,
         name: &str,
     ) -> kube::Result<Option<ChallengeInstance>>;
-    async fn shell(&self, target: &Target) -> kube::Result<AttachedProcess>;
+    async fn shell(&self, target: &Target) -> anyhow::Result<Shell>;
 }
 
 /// The real cluster.
@@ -120,11 +165,102 @@ impl Machines for Kube {
             .await
     }
 
-    async fn shell(&self, target: &Target) -> kube::Result<AttachedProcess> {
-        let params = AttachParams::interactive_tty().container(MACHINE_CONTAINER);
-        Api::<Pod>::namespaced(self.0.clone(), &target.namespace)
-            .exec(&target.pod, ["/bin/sh", "-c", SHELL], &params)
-            .await
+    async fn shell(&self, target: &Target) -> anyhow::Result<Shell> {
+        match target {
+            Target::Exec { namespace, pod } => {
+                let params = AttachParams::interactive_tty().container(MACHINE_CONTAINER);
+                let process = Api::<Pod>::namespaced(self.0.clone(), namespace)
+                    .exec(pod, ["/bin/sh", "-c", SHELL], &params)
+                    .await?;
+                exec_shell(process)
+            }
+            Target::Ssh {
+                namespace,
+                host,
+                user,
+            } => {
+                let secret = Api::<Secret>::namespaced(self.0.clone(), namespace)
+                    .get(SSH_SECRET)
+                    .await
+                    .context("reading the SSH keys of the instance")?;
+                let field = |key: &str| -> anyhow::Result<String> {
+                    let data = secret
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get(key))
+                        .with_context(|| format!("{SSH_SECRET} has no {key}"))?;
+                    Ok(String::from_utf8(data.0.clone())?)
+                };
+                crate::ssh::open(
+                    host,
+                    SSH_PORT,
+                    user,
+                    &field(SSH_SECRET_STUDENT_KEY)?,
+                    &field(SSH_SECRET_KNOWN_HOSTS)?,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// Wraps a Kubernetes exec session as a [`Shell`].
+fn exec_shell(mut process: AttachedProcess) -> anyhow::Result<Shell> {
+    let (Some(stdin), Some(mut stdout), Some(resize)) =
+        (process.stdin(), process.stdout(), process.terminal_size())
+    else {
+        anyhow::bail!("the shell has no tty");
+    };
+    let (tx, output) = mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stdout.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    Ok(Shell {
+        output,
+        io: Box::new(ExecIo {
+            stdin: Box::pin(stdin),
+            resize,
+            process: Some(process),
+        }),
+    })
+}
+
+struct ExecIo {
+    stdin: std::pin::Pin<Box<dyn AsyncWrite + Send>>,
+    resize: futures::channel::mpsc::Sender<TerminalSize>,
+    process: Option<AttachedProcess>,
+}
+
+#[async_trait]
+impl ShellIo for ExecIo {
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.stdin.write_all(data).await
+    }
+
+    async fn resize(&mut self, cols: u16, rows: u16) {
+        let _ = self
+            .resize
+            .send(TerminalSize {
+                width: cols,
+                height: rows,
+            })
+            .await;
+    }
+
+    async fn close(&mut self) {
+        if let Some(process) = self.process.take() {
+            process.abort();
+        }
     }
 }
 
@@ -197,73 +333,53 @@ async fn session(
     idle: Duration,
 ) -> String {
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let mut process = match machines.shell(&target).await {
-        Ok(p) => p,
+    let Shell { mut output, mut io } = match machines.shell(&target).await {
+        Ok(shell) => shell,
         Err(e) => {
-            let msg = format!("cannot open a shell: {e}");
+            let msg = format!("cannot open a shell: {e:#}");
             let _ = ws_tx.send(exit_message(&msg)).await;
             return msg;
         }
     };
-    let (Some(mut stdin), Some(mut stdout), Some(resize)) =
-        (process.stdin(), process.stdout(), process.terminal_size())
-    else {
-        return "the shell has no tty".into();
-    };
 
-    let output = async {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match stdout.read(&mut buf).await {
-                Ok(0) | Err(_) => return "the shell exited".to_string(),
-                Ok(n) => {
-                    if ws_tx
-                        .send(Message::Binary(buf[..n].to_vec().into()))
-                        .await
-                        .is_err()
-                    {
+    let reason = {
+        let output = async {
+            while let Some(chunk) = output.recv().await {
+                if ws_tx.send(Message::Binary(chunk.into())).await.is_err() {
+                    return "the browser disconnected".to_string();
+                }
+            }
+            "the shell exited".to_string()
+        };
+        let input = async {
+            loop {
+                let msg = match tokio::time::timeout(idle, ws_rx.next()).await {
+                    Err(_) => return "idle timeout".to_string(),
+                    Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => {
                         return "the browser disconnected".into();
                     }
+                    Ok(Some(Ok(msg))) => msg,
+                };
+                match msg {
+                    Message::Binary(data) => {
+                        if io.write(&data).await.is_err() {
+                            return "the shell exited".into();
+                        }
+                    }
+                    Message::Text(text) => match serde_json::from_str::<Control>(&text) {
+                        Ok(Control::Resize { cols, rows }) => io.resize(cols, rows).await,
+                        Err(_) => tracing::debug!("ignored an unknown control message"),
+                    },
+                    _ => {}
                 }
             }
+        };
+        tokio::select! {
+            r = output => r,
+            r = input => r,
         }
     };
-    let input = async {
-        loop {
-            let msg = match tokio::time::timeout(idle, ws_rx.next()).await {
-                Err(_) => return "idle timeout".to_string(),
-                Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => {
-                    return "the browser disconnected".into();
-                }
-                Ok(Some(Ok(msg))) => msg,
-            };
-            match msg {
-                Message::Binary(data) => {
-                    if stdin.write_all(&data).await.is_err() {
-                        return "the shell exited".into();
-                    }
-                }
-                Message::Text(text) => match serde_json::from_str::<Control>(&text) {
-                    Ok(Control::Resize { cols, rows }) => {
-                        let _ = resize
-                            .clone()
-                            .send(TerminalSize {
-                                width: cols,
-                                height: rows,
-                            })
-                            .await;
-                    }
-                    Err(_) => tracing::debug!("ignored an unknown control message"),
-                },
-                _ => {}
-            }
-        }
-    };
-    let reason = tokio::select! {
-        r = output => r,
-        r = input => r,
-    };
-    process.abort();
+    io.close().await;
     reason
 }
 
@@ -308,7 +424,8 @@ mod tests {
             "spec": {"challenge": "hello", "owner": {"userID": "u1"}},
             "status": {"phase": phase, "namespace": "inst-hello-1", "machines": [
                 {"name": "box", "runtime": "pod", "ready": true, "pod": "box"},
-                {"name": "vm", "runtime": "vm", "ready": true}]}
+                {"name": "vm", "runtime": "vm", "ready": true, "address": "vm.inst-hello-1.svc"},
+                {"name": "booting", "runtime": "vm", "ready": false, "address": "booting.inst-hello-1.svc"}]}
         }))
         .unwrap()
     }
@@ -324,10 +441,30 @@ mod tests {
         let target = resolve(&claims("u1", "box", terminal()), Some(&instance("Ready"))).unwrap();
         assert_eq!(
             target,
-            Target {
+            Target::Exec {
                 namespace: "inst-hello-1".into(),
                 pod: "box".into()
             }
+        );
+    }
+
+    #[test]
+    fn resolves_a_vm_to_ssh_as_the_student() {
+        let target = resolve(&claims("u1", "vm", terminal()), Some(&instance("Ready"))).unwrap();
+        assert_eq!(
+            target,
+            Target::Ssh {
+                namespace: "inst-hello-1".into(),
+                host: "vm.inst-hello-1.svc".into(),
+                user: "student".into()
+            }
+        );
+        let root = AccessKind::Terminal {
+            user: "root".into(),
+        };
+        assert_eq!(
+            resolve(&claims("u1", "vm", root), Some(&instance("Ready"))),
+            Err(Denied::NotStudent)
         );
     }
 
@@ -352,7 +489,7 @@ mod tests {
                 Denied::NoMachine,
             ),
             (
-                claims("u1", "vm", terminal()),
+                claims("u1", "booting", terminal()),
                 Some(&ready),
                 Denied::NoMachine,
             ),
